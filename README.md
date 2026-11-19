@@ -5,7 +5,8 @@
 [![최신 릴리스](https://img.shields.io/github/v/release/sudapeople/chzzk-check)](https://github.com/sudapeople/chzzk-check/releases/latest)
 [![릴리스 날짜](https://img.shields.io/github/release-date/sudapeople/chzzk-check)](https://github.com/sudapeople/chzzk-check/releases/latest)
 [![다운로드 수](https://img.shields.io/github/downloads/sudapeople/chzzk-check/total)](https://github.com/sudapeople/chzzk-check/releases)
-[![라이선스](https://img.shields.io/github/license/sudapeople/chzzk-check)](LICENSE)<br>
+[![라이선스](https://img.shields.io/github/license/sudapeople/chzzk-check)](LICENSE)
+[![자체 점검](https://github.com/sudapeople/chzzk-check/actions/workflows/selftest.yml/badge.svg)](https://github.com/sudapeople/chzzk-check/actions/workflows/selftest.yml)<br>
 [![플랫폼](https://img.shields.io/badge/platform-macOS%2014%2B%20%7C%20Apple%20Silicon-blue?logo=apple)](#내려받기)
 [![Swift](https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white)](#빌드설치)
 [![SwiftUI](https://img.shields.io/badge/UI-SwiftUI-0A84FF?logo=swift&logoColor=white)](src/ChzzkCheck.swift)
@@ -238,6 +239,7 @@ chzzk-check/
 ├── scripts/
 │   ├── build.sh              빌드·설치·릴리스 zip
 │   └── make-social-preview.swift  대표 이미지 생성
+├── .github/workflows/selftest.yml   올릴 때마다 판정 로직 자체 점검
 └── build/                    빌드 산출물 (지워도 다시 만들어짐)
 ```
 

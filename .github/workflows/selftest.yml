@@ -1,0 +1,14 @@
+# 판정 로직 자체 점검. 네트워크를 쓰지 않는다.
+name: selftest
+on:
+  push:
+  pull_request:
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node src/check.mjs selftest
