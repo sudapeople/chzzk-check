@@ -1,5 +1,10 @@
 // 치지직 점검.app : 번들 안의 check.mjs 를 한 번 실행해 그 결과(JSON)를 화면에 보여 주는 껍데기.
 // 판정 로직은 전부 check.mjs 에 있다. 창을 닫으면 앱도 끝난다(상시 프로세스 없음).
+//
+// 리소스 정리 원칙: 동작 하나가 끝날 때마다 그 동작이 쓴 것을 치운다.
+//   - check.mjs 프로세스: 끝나면 기다려 거두고 파이프를 닫고 참조를 비운다 (Store.spawn)
+//   - 취소, 목록에서 지우기, 창 닫기, 앱 종료 때 남은 프로세스를 끝낸다 (stopAll)
+//   - 목록과 그림 캐시에는 상한을 둔다 (maxResults, ImageCache)
 import Charts
 import SwiftUI
 
@@ -36,9 +41,10 @@ struct Broadcast: Decodable, Identifiable {
 
 struct Pattern: Decodable { let broadcasts: [Broadcast]; let roseCount: Int; let text: String }
 struct WatchRow: Decodable { let t: Double; let viewers: Int; let chatUsers: Int? }
+struct TitleChange: Decodable { let t: Double; let title: String }
 
 /// 지켜보기 화면에 넘기는 상태
-struct WatchState { let rows: [WatchRow]; let jump: Jump?; let range: [Int]; let active: Bool }
+struct WatchState { let rows: [WatchRow]; let jump: Jump?; let range: [Int]; let changes: [TitleChange]; let active: Bool }
 
 struct Snap: Decodable {
     let checkedAt: Double
@@ -69,6 +75,7 @@ struct Analysis: Decodable {
     let chatRate: Double?
     let chatters: Int
     let topShare: Double?
+    let context: [String]?     // 시청자가 늘 만한 정상적인 사정 (드롭스, 같이보기 등)
     let signals: [String]
 }
 
@@ -79,6 +86,8 @@ struct Event: Decodable {
     let prev: Prev?
     let dir: String?
     let text: String?
+    let draft: String?
+    let changes: [TitleChange]?
     let history: [Hist]?
     let pattern: Pattern?
     let channelDir: String?
@@ -99,6 +108,7 @@ struct CheckResult: Identifiable {
     let prev: Prev?
     let dir: String?
     let text: String
+    let draft: String
     let history: [Hist]
     let pattern: Pattern?
     let channelDir: String?
@@ -126,6 +136,37 @@ enum SortMode: String, CaseIterable { case signals = "신호", viewers = "시청
 func date(_ ms: Double) -> Date { Date(timeIntervalSince1970: ms / 1000) }
 func rate(_ v: Double) -> String { v < 10 ? String(format: "%.1f", v) : String(Int(v.rounded())) }
 func median(_ v: [Double]) -> Double? { v.isEmpty ? nil : v.sorted()[v.count / 2] }
+
+/// 증거 폴더의 방송 화면 그림. 화면을 다시 그릴 때마다 디스크에서 읽지 않게 하되, 20장까지만 쥐고 있는다.
+enum ImageCache {
+    private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 20
+        return c
+    }()
+
+    static func image(_ path: String) -> NSImage? {
+        if let hit = cache.object(forKey: path as NSString) { return hit }
+        guard let img = NSImage(contentsOfFile: path) else { return nil }
+        cache.setObject(img, forKey: path as NSString)
+        return img
+    }
+
+    static func clear() { cache.removeAllObjects() }
+}
+
+/// 자식 프로세스의 오류 출력을 오는 대로 받아 둔다 (읽기 스레드와 메인 스레드가 함께 쓴다)
+final class ErrBox: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+
+    func append(_ d: Data) { lock.lock(); data.append(d); lock.unlock() }
+
+    var text: String {
+        lock.lock(); defer { lock.unlock() }
+        return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
 
 extension Color {
     /// 아이콘의 차트 선과 같은 초록
@@ -158,6 +199,9 @@ final class Store {
     var watchRows: [WatchRow] = []
     var watchJump: Jump?
     var watchRange: [Int] = []
+    var watchChanges: [TitleChange] = []
+    /// 목록에 쥐고 있는 점검 결과의 상한. 넘으면 오래된 것부터 버린다
+    static let maxResults = 300
     private var watchProcess: Process?
     private var process: Process?
     private var offline: [String] = []
@@ -177,7 +221,7 @@ final class Store {
 
     func watchState(for id: String) -> WatchState? {
         guard watchId == id, !watchRows.isEmpty else { return nil }
-        return WatchState(rows: watchRows, jump: watchJump, range: watchRange, active: watching)
+        return WatchState(rows: watchRows, jump: watchJump, range: watchRange, changes: watchChanges, active: watching)
     }
 
     var selected: CheckResult? { results.first { $0.id == selection } }
@@ -226,8 +270,18 @@ final class Store {
     }
 
     func remove(_ id: String) {
+        if watchId == id { stopWatch(); watchRows = []; watchId = nil }   // 지운 방송을 계속 지켜보지 않는다
         results.removeAll { $0.id == id }
         if selection == id { selection = nil }
+    }
+
+    /// 목록, 지켜보기 기록, 그림 캐시를 모두 비운다. 저장 폴더의 파일은 건드리지 않는다
+    func clearResults() {
+        stopAll()
+        results = []; selection = nil
+        watchId = nil; watchRows = []; watchJump = nil; watchRange = []; watchChanges = []
+        ImageCache.clear()
+        status = "목록을 비웠습니다"
     }
 
     func cancel() { process?.terminate() }
@@ -254,13 +308,14 @@ final class Store {
 
     func startWatch(_ r: CheckResult) {
         stopWatch()
-        watchId = r.id; watchName = r.s.name; watchRows = []; watchJump = nil; watchRange = []
+        watchId = r.id; watchName = r.s.name; watchRows = []; watchJump = nil; watchRange = []; watchChanges = []
         watchProcess = spawn(["watch", r.id, "--interval", "30"], onLine: { [weak self] line in
             guard let self, let e = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)) else { return }
             if e.type == "tick", e.channelId == self.watchId {
                 if let rows = e.rows { self.watchRows = rows } else if let row = e.row { self.watchRows.append(row) }
                 self.watchJump = e.jump
                 self.watchRange = e.range30 ?? []
+                self.watchChanges = e.changes ?? []
             } else if e.type == "watchEnd" {
                 self.status = e.message ?? "지켜보기가 끝났습니다"
             }
@@ -277,9 +332,11 @@ final class Store {
         watching = false
     }
 
+    /// 돌고 있는 점검·지켜보기 프로세스를 모두 끝낸다. 거두기와 파이프 닫기는 spawn 의 정리 단계가 한다
     func stopAll() {
         stopWatch()
         process?.terminate()
+        process = nil
     }
 
     // MARK: 내보내기
@@ -289,6 +346,13 @@ final class Store {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(r.text, forType: .string)
         status = "요약문을 복사했습니다"
+    }
+
+    func copyDraft() {
+        guard let r = selected, !r.draft.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(r.draft, forType: .string)
+        status = "신고문 초안을 복사했습니다. 보내기 전에 내용을 확인하고 고쳐 쓰세요."
     }
 
     private func png<V: View>(_ view: V) -> Data? {
@@ -353,6 +417,57 @@ final class Store {
 
     func openDataDir() { NSWorkspace.shared.open(URL(fileURLWithPath: dataDir)) }
 
+    static let repoURL = URL(string: "https://github.com/sudapeople/chzzk-check")!
+    static var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?" }
+
+    /// GitHub 릴리스와 버전을 비교한다. 메뉴에서 누를 때만 묻고, 요청이 끝나면 세션을 닫는다
+    func checkForUpdate() {
+        Task {
+            struct Release: Decodable { let tag_name: String; let html_url: String }
+            var request = URLRequest(url: URL(string: "https://api.github.com/repos/sudapeople/chzzk-check/releases/latest")!)
+            request.timeoutInterval = 10
+            let session = URLSession(configuration: .ephemeral)
+            defer { session.finishTasksAndInvalidate() }
+            let alert = NSAlert()
+            do {
+                let (data, _) = try await session.data(for: request)
+                let rel = try JSONDecoder().decode(Release.self, from: data)
+                let latest = rel.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+                if latest.compare(Self.version, options: .numeric) == .orderedDescending {
+                    alert.messageText = "새 버전 \(latest) 이 있습니다"
+                    alert.informativeText = "지금 버전은 \(Self.version) 입니다. 릴리스 페이지에서 내려받을 수 있습니다."
+                    alert.addButton(withTitle: "릴리스 페이지 열기")
+                    alert.addButton(withTitle: "나중에")
+                    if alert.runModal() == .alertFirstButtonReturn, let url = URL(string: rel.html_url) { NSWorkspace.shared.open(url) }
+                    return
+                }
+                alert.messageText = "최신 버전입니다"
+                alert.informativeText = "지금 버전 \(Self.version)"
+            } catch {
+                alert.messageText = "업데이트를 확인하지 못했습니다"
+                alert.informativeText = error.localizedDescription
+            }
+            alert.runModal()
+        }
+    }
+
+    /// 저장 폴더가 디스크를 얼마나 쓰는지. 파일이 많을 수 있어 메인 스레드 밖에서 센다
+    nonisolated static func usage(of dir: String) async -> String {
+        await Task.detached { countUsage(dir) }.value
+    }
+
+    private nonisolated static func countUsage(_ dir: String) -> String {
+        var bytes = 0, files = 0
+        if let e = FileManager.default.enumerator(at: URL(fileURLWithPath: dir), includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) {
+            for case let url as URL in e {
+                guard let v = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), v.isRegularFile == true else { continue }
+                bytes += v.fileSize ?? 0
+                files += 1
+            }
+        }
+        return "\(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)) · 파일 \(files.formatted())개"
+    }
+
     // MARK: check.mjs 실행
 
     /// check.mjs 를 띄워 한 줄씩 받는다. 띄우지 못하면 nil.
@@ -371,17 +486,34 @@ final class Store {
         p.arguments = [script.path, "--json"] + extra
         p.environment = ProcessInfo.processInfo.environment.merging(["CHZZK_CHECK_DIR": dataDir]) { $1 }
         let out = Pipe(), err = Pipe()
+        p.standardInput = FileHandle.nullDevice
         p.standardOutput = out
         p.standardError = err
+        // 오류 출력은 오는 대로 비운다. 쌓아 두면 파이프가 차서 자식 프로세스가 멈출 수 있다
+        let errBox = ErrBox()
+        err.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil } else { errBox.append(d) }
+        }
         Task {
+            var launched = false
+            var failure: String?
             do {
                 try p.run()
+                launched = true
                 for try await line in out.fileHandleForReading.bytes.lines { onLine(line) }
-                let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                onEnd(e.trimmingCharacters(in: .whitespacesAndNewlines))
             } catch {
-                onEnd(error.localizedDescription)
+                failure = error.localizedDescription
             }
+            // 정리: 아직 돌고 있으면 끝내고, 끝날 때까지 기다려 거둔 뒤, 파이프를 닫는다
+            if launched {
+                if p.isRunning { p.terminate() }
+                await Task.detached { p.waitUntilExit() }.value
+            }
+            err.fileHandleForReading.readabilityHandler = nil
+            try? out.fileHandleForReading.close()
+            try? err.fileHandleForReading.close()
+            onEnd(failure ?? errBox.text)
         }
         return p
     }
@@ -406,9 +538,10 @@ final class Store {
         case "start": total = e.total ?? 0
         case "result":
             guard let s = e.s, let a = e.a else { return }
-            let r = CheckResult(s: s, a: a, prev: e.prev, dir: e.dir, text: e.text ?? "", history: e.history ?? [],
+            let r = CheckResult(s: s, a: a, prev: e.prev, dir: e.dir, text: e.text ?? "", draft: e.draft ?? "", history: e.history ?? [],
                                 pattern: e.pattern, channelDir: e.channelDir)
             if let i = results.firstIndex(where: { $0.id == r.id }) { results[i] = r } else { results.append(r) }
+            if results.count > Self.maxResults { results.removeFirst(results.count - Self.maxResults) }
             done += 1
             if select { selection = r.id }
             // 관심 채널 이름이 바뀌었으면 따라간다
@@ -495,7 +628,9 @@ struct ContentView: View {
         .task {
             // 실행 인자로 채널을 주면 바로 점검: open -a "치지직 점검" --args -check <주소 또는 ID>
             // (그냥 값만 넘기면 AppKit 이 파일 열기로 받아들여 창이 안 뜬다)
-            if let id = UserDefaults.standard.string(forKey: "check"), !id.isEmpty {
+            if Store.node == nil {
+                showNodeMissing()
+            } else if let id = UserDefaults.standard.string(forKey: "check"), !id.isEmpty {
                 store.input = id
                 store.checkInput()
             } else if UserDefaults.standard.bool(forKey: "demo") {   // --args -demo 1 : 예시 데이터로 시작
@@ -503,6 +638,19 @@ struct ContentView: View {
             } else {
                 inputFocused = true
             }
+        }
+    }
+
+    private func showNodeMissing() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Node.js 가 필요합니다"
+        alert.informativeText = "치지직 점검은 Node.js 로 점검을 실행합니다. 터미널에서 아래 명령으로 설치한 뒤 앱을 다시 열어 주세요.\n\nbrew install node"
+        alert.addButton(withTitle: "명령 복사")
+        alert.addButton(withTitle: "닫기")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("brew install node", forType: .string)
         }
     }
 
@@ -795,6 +943,17 @@ struct DetailContent: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            // 시청자가 늘 만한 정상적인 사정이 있는지. 신호와 함께 봐야 한다
+            if let ctx = a.context, !ctx.isEmpty {
+                ForEach(ctx, id: \.self) { x in
+                    Label("함께 볼 상황: \(x)", systemImage: "lightbulb")
+                        .font(.callout).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                Label("드롭스·같이보기·파티·유료 광고 표시 없음", systemImage: "minus.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
@@ -904,7 +1063,7 @@ struct DetailContent: View {
     private func watchCard(_ w: WatchState) -> some View {
         let range = w.range.count == 2 ? " · 최근 30분 시청자 \(w.range[0])~\(w.range[1])명" : ""
         return Card(title: w.active ? "지켜보는 중 (30초 간격, \(w.rows.count)회 기록)" : "지켜보기 기록 (\(w.rows.count)회, 멈춤)",
-                    note: "실제 시청자는 들어오고 나가서 숫자가 조금씩 흔들립니다. 한 번에 계단처럼 오르거나 오래 전혀 움직이지 않으면 눈여겨볼 만합니다. 빨간 영역은 급증으로 판정한 구간입니다. 앱을 닫으면 멈추고, 기록은 저장 폴더의 '지켜보기'에 남습니다.") {
+                    note: "실제 시청자는 들어오고 나가서 숫자가 조금씩 흔들립니다. 한 번에 계단처럼 오르거나 오래 전혀 움직이지 않으면 눈여겨볼 만합니다. 빨간 영역은 급증으로 판정한 구간, 주황 점선은 방송 제목이 바뀐 시점입니다. 시작할 때, 제목이 바뀔 때, 급증이 잡힐 때 방송 화면을 저장합니다. 앱을 닫으면 멈추고, 기록은 저장 폴더의 '지켜보기'에 남습니다.") {
             HStack {
                 Text("\(date(w.rows.first!.t).formatted(date: .omitted, time: .shortened))부터\(range)")
                     .font(.callout).foregroundStyle(.secondary)
@@ -929,9 +1088,21 @@ struct DetailContent: View {
                             .foregroundStyle(by: .value("종류", "채팅방 인원"))
                     }
                 }
+                ForEach(w.changes.indices, id: \.self) { i in
+                    RuleMark(x: .value("제목 변경", date(w.changes[i].t)))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                        .foregroundStyle(.orange)
+                        .annotation(position: .top, alignment: .leading) {
+                            Text("제목 변경").font(.caption2).foregroundStyle(.orange)
+                        }
+                }
             }
             .chartForegroundStyleScale(["시청자수": Color.blue, "채팅방 인원": Color.brand])
             .frame(height: 200)
+            ForEach(w.changes.indices, id: \.self) { i in
+                Text("\(date(w.changes[i].t).formatted(date: .omitted, time: .shortened)) 제목 변경: \(w.changes[i].title)")
+                    .font(.caption).foregroundStyle(.orange).lineLimit(1)
+            }
         }
     }
 
@@ -952,7 +1123,7 @@ struct DetailContent: View {
     }
 
     @ViewBuilder private var screenshot: some View {
-        if let dir = r.dir, let img = NSImage(contentsOfFile: dir + "/화면.jpg") {
+        if let dir = r.dir, let img = ImageCache.image(dir + "/화면.jpg") {
             Card(title: "점검 시점 방송 화면") {
                 Image(nsImage: img).resizable().scaledToFit().frame(maxHeight: 360)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -1027,6 +1198,7 @@ struct PatternReportView: View {
 
 struct SettingsView: View {
     @Bindable var store: Store
+    @State private var usage = "계산 중…"
 
     var body: some View {
         Form {
@@ -1039,7 +1211,12 @@ struct SettingsView: View {
                     Button("기본값으로") { store.dataDir = Store.defaultDataDir }
                         .disabled(store.dataDir == Store.defaultDataDir)
                 }
-                Text("점검할 때마다 요약문, 원본 데이터, 방송 화면 사진이 이 폴더의 '증거' 아래에 저장되고, 점검기록.tsv 에 한 줄씩 쌓입니다. 채팅 닉네임과 내용은 저장하지 않습니다.")
+                LabeledContent("쓰고 있는 용량", value: usage)
+                    .task(id: store.dataDir) {
+                        usage = "계산 중…"
+                        usage = await Store.usage(of: store.dataDir)
+                    }
+                Text("점검할 때마다 요약문, 원본 데이터, 방송 화면 사진이 이 폴더의 '증거' 아래에 저장되고, 점검기록.tsv 에 한 줄씩 쌓입니다. 채팅 닉네임과 내용은 저장하지 않습니다. 증거는 앱이 자동으로 지우지 않으니, 필요 없어진 것은 Finder에서 직접 정리하세요.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("실행 환경") {
@@ -1086,6 +1263,7 @@ struct ChzzkCheckApp: App {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(replacing: .appInfo) {
                 Button("치지직 점검에 관하여") { showAbout() }
+                Button("업데이트 확인…") { store.checkForUpdate() }
             }
             CommandMenu("점검") {
                 Button("주소 입력") { store.focusTick += 1 }.keyboardShortcut("l")
@@ -1108,6 +1286,8 @@ struct ChzzkCheckApp: App {
                 Divider()
                 Button("요약 복사") { store.copySummary() }.keyboardShortcut("c", modifiers: [.command, .shift])
                     .disabled(store.selected == nil)
+                Button("신고문 초안 복사") { store.copyDraft() }.keyboardShortcut("c", modifiers: [.command, .option])
+                    .disabled(store.selected == nil)
                 Button("보고서 그림 저장") { store.saveReport() }.keyboardShortcut("s")
                     .disabled(store.selected == nil)
                 Button("반복 패턴 보고서 저장") { store.savePatternReport() }.keyboardShortcut("s", modifiers: [.command, .shift])
@@ -1119,12 +1299,17 @@ struct ChzzkCheckApp: App {
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(store.selected == nil)
                 Divider()
+                Button("목록 비우기") { store.clearResults() }.keyboardShortcut(.delete, modifiers: [.command, .shift])
+                    .disabled(store.results.isEmpty)
                 Button("저장 폴더 열기") { store.openDataDir() }
                 Button("통계 사이트 열기 (소프트콘 뷰어십)") { store.openStats() }
             }
             CommandGroup(replacing: .help) {
                 Button("판정 기준 보기") { showCriteria() }
                 Button("예시 데이터로 둘러보기") { store.showDemo() }.disabled(store.busy)
+                Divider()
+                Button("GitHub 저장소 열기") { NSWorkspace.shared.open(Store.repoURL) }
+                Button("문제 알리기") { NSWorkspace.shared.open(Store.repoURL.appendingPathComponent("issues")) }
             }
         }
 
@@ -1151,9 +1336,12 @@ struct ChzzkCheckApp: App {
     }
 
     private func showAbout() {
-        let credits = NSAttributedString(
-            string: "치지직 공개 정보로 방송의 시청자수, 채팅방 접속 인원, 채팅 흐름을 한 번에 점검하고 신고용 증거를 남깁니다.\n\n의심 신호는 판정 기준을 넘었다는 뜻일 뿐 조작을 확정하지 않습니다.",
-            attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+        let base: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]
+        let credits = NSMutableAttributedString(
+            string: "치지직 공개 정보로 방송의 시청자수, 채팅방 접속 인원, 채팅 흐름을 한 번에 점검하고 신고용 증거를 남깁니다.\n\n의심 신호는 판정 기준을 넘었다는 뜻일 뿐 조작을 확정하지 않습니다.\n\n",
+            attributes: base)
+        credits.append(NSAttributedString(string: "github.com/sudapeople/chzzk-check",
+                                          attributes: base.merging([.link: Store.repoURL]) { $1 }))
         NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
         NSApp.activate(ignoringOtherApps: true)
     }

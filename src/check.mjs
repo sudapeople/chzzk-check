@@ -6,6 +6,7 @@
 //                                                   방송 목록을 훑어 의심 신호가 있는 방송 찾기
 //   node check.mjs watch <채널> [--interval 30]     지켜보기: 멈출 때까지 일정 간격으로 시청자수 기록
 //   node check.mjs pattern <채널>                   지금까지 쌓인 기록으로 방송별 반복 패턴 요약
+//   (점검할 때마다 증거 폴더에 요약.txt, 원본.json, 화면.jpg, 신고문_초안.txt, 해시.txt 를 남긴다)
 //   node check.mjs demo                             실제 채널이 아닌 예시 데이터 (화면 둘러보기용, 저장 안 함)
 //   node check.mjs selftest                         판정 로직 자체 점검
 //   --json 을 붙이면 한 줄에 JSON 하나씩 출력 (맥 앱 '치지직 점검.app' 이 이 출력을 읽는다)
@@ -13,6 +14,7 @@
 // 결과: 증거/<채널>/<시각>/ 에 요약.txt, 원본.json, 화면.jpg / 점검기록.tsv 에 한 줄씩 누적
 // 의심 신호는 판정 기준을 넘었다는 뜻일 뿐, 조작을 확정하지 않는다.
 import assert from 'node:assert';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +48,7 @@ const args = argv.filter((x) => x !== '--json');
 const emit = (o) => { if (JSON_OUT) console.log(JSON.stringify(o)); };
 const say = (...x) => { if (!JSON_OUT) console.log(...x); };
 
+const NET_TIMEOUT_MS = 10000;   // 치지직 서버가 응답하지 않을 때 요청을 붙잡고 있지 않는다
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const full = (ms) => new Date(ms).toLocaleString('sv-SE');
 const hm = (ms) => new Date(ms).toLocaleTimeString('sv-SE').slice(0, 5);
@@ -55,12 +58,13 @@ const toMs = (str) => Date.parse(String(str).replace(' ', 'T'));   // 'YYYY-MM-D
 const safe = (s) => String(s).replace(/[\/\\:*?"<>|\s]+/g, '_');
 
 async function api(url) {
-    const r = await fetch(url, { headers: { 'User-Agent': UA } });
+    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(NET_TIMEOUT_MS) });
     const j = await r.json().catch(() => ({}));
     return { content: j.content ?? null, date: r.headers.get('date') };
 }
 
 // 채팅 서버에 읽기 전용으로 잠깐 붙어 최근 채팅 50개와 채팅방 접속 인원만 받고 끊는다.
+// 성공·오류·시간 초과 어느 경로든 done() 을 거쳐 타이머를 지우고 소켓을 닫는다.
 function recentChat(cid, token, count = 50) {
     return new Promise((resolve) => {
         const n = [...cid].reduce((a, c) => a + c.charCodeAt(0), 0) % 9 + 1;
@@ -99,6 +103,10 @@ async function collect(channelId) {
         chatActive: d.chatActive,
         chatGroup: d.chatAvailableGroup ?? '',
         chatCondition: d.chatAvailableCondition ?? '',
+        drops: d.dropsCampaignNo ?? null,          // 드롭스(시청 보상) 캠페인
+        watchParty: d.watchPartyTag ?? null,       // 같이보기
+        party: !!d.party,                          // 파티 방송
+        paidPromotion: !!d.paidPromotion,          // 유료 광고 포함 표시
         thumbUrl: d.liveImageUrl ? d.liveImageUrl.replace('{type}', '720') : null,
         vodViews: (vd.content?.data || []).map((v) => v.readCount).filter((n) => Number.isFinite(n)),
         chatUsers: null,
@@ -157,6 +165,14 @@ function analyze(s, prev) {
     const chatters = Object.keys(perAccount).length;
     const topShare = s.chats.length ? Math.max(...Object.values(perAccount)) / s.chats.length : null;
 
+    // 시청자가 늘 만한 정상적인 사정. 신호가 아니라 함께 봐야 할 상황이다.
+    const context = [];
+    if (s.drops) context.push('드롭스(시청 보상) 진행 중: 보상을 받으려고 방송을 켜 두는 시청자가 있을 수 있음');
+    if (s.watchParty) context.push('같이보기 방송');
+    if (s.party) context.push('파티 방송: 다른 채널 시청자가 함께 들어올 수 있음');
+    if (s.paidPromotion) context.push('유료 광고 포함 표시가 켜진 방송');
+    if (prev?.title && prev.title !== s.title) context.push(`직전 점검(${prev.time.slice(11, 16)}) 이후 방송 제목이 바뀜`);
+
     const signals = [];
     if (s.chatUsers != null && V >= T.minViewers && s.chatUsers < V * T.chatRoomRatio)
         signals.push(`채팅방 접속 인원(${s.chatUsers}명)이 시청자수(${V}명)의 ${T.chatRoomRatio * 100}% 미만`);
@@ -176,7 +192,7 @@ function analyze(s, prev) {
         signals.push(`(참고) 시청자수(${V}명)가 팔로워(${s.followers}명)의 ${T.followerRatio * 100}%를 넘음`);
     if (s.chats.length >= 20 && V >= T.fewChattersViewers && chatters <= T.fewChatters)
         signals.push(`(참고) 시청자 ${V}명인데 최근 채팅 ${s.chats.length}개가 계정 ${chatters}개에서만 나옴`);
-    return { lastChatMin, chats30: recent.length, chatters30, vodMedian, series, jump, chatSpanMin, chatRate, chatters, topShare, signals };
+    return { lastChatMin, chats30: recent.length, chatters30, vodMedian, series, jump, chatSpanMin, chatRate, chatters, topShare, context, signals };
 }
 
 function summary(s, a, prev) {
@@ -203,6 +219,7 @@ function summary(s, a, prev) {
     }
     if (s.vodViews.length) L.push(`다시보기 조회수(최근 ${s.vodViews.length}개): ${s.vodViews.join(', ')} / 중앙값 ${a.vodMedian}`);
     if (prev) L.push(`같은 방송의 직전 점검: ${prev.time} 시청자 ${prev.viewers}명, 채팅방 ${prev.chatUsers}명`);
+    L.push(`참고할 상황: ${a.context.length ? a.context.join(' / ') : '드롭스·같이보기·파티·유료 광고 표시 없음'}`);
     L.push('');
     L.push(a.signals.length ? `의심 신호 ${a.signals.length}건:` : '의심 신호 없음');
     for (const x of a.signals) L.push(`  - ${x}`);
@@ -219,9 +236,31 @@ function historyRows() {
     return fs.readFileSync(HISTORY, 'utf8').trim().split('\n').slice(1).map((l) => l.split('\t'));
 }
 
+// 치지직에 확인을 요청할 때 쓸 글의 초안. 본 것만 적고 단정하지 않는다.
+function draft(s, a, pattern) {
+    const L = ['[비정상 시청자 유입 확인 요청]', '',
+        `채널: ${s.name} (https://chzzk.naver.com/live/${s.channelId})`,
+        `방송: ${s.title} / ${s.category} / ${s.openDate} 시작`,
+        `확인 시각: ${full(s.checkedAt)}`, '', '관찰한 내용',
+        `- 확인 시점 시청자수 ${s.viewers}명` + (s.chatUsers != null ? `, 채팅방 접속 인원 ${s.chatUsers}명` : '')
+            + (s.followers != null ? `, 팔로워 ${s.followers}명` : '')];
+    for (const x of a.signals) L.push(`- ${x.replace(/^\(참고\) /, '')}`);
+    if (a.chatRate != null)
+        L.push(`- 최근 채팅 ${s.chats.length}개가 ${Math.round(a.chatSpanMin)}분에 걸쳐 있음 (참여 계정 ${a.chatters}개)`);
+    if (pattern && pattern.broadcasts.length > 1)
+        L.push(`- 기록한 방송 ${pattern.broadcasts.length}편 중 ${pattern.roseCount}편에서 방송 도중 시청자수가 크게 늘어남`);
+    L.push('', '함께 확인한 상황');
+    if (a.context.length) for (const x of a.context) L.push(`- ${x}`);
+    else L.push('- 드롭스, 같이보기, 파티, 유료 광고 표시는 없었음');
+    L.push('', '첨부 자료', '- 점검 보고서 그림, 요약문, 원본 데이터(JSON), 확인 시점 방송 화면', '',
+        '위 내용은 치지직에 공개된 정보를 기록한 것이며, 조작이라고 단정하지 않습니다.',
+        '비정상적인 유입인지 확인을 부탁드립니다.');
+    return L.join('\n');
+}
+
 function loadPrev(channelId, openDate) {
     const r = historyRows().findLast((c) => c[1] === channelId && c[3] === openDate);
-    return r ? { time: r[0], viewers: Number(r[4]), chatUsers: r[5] } : null;
+    return r ? { time: r[0], viewers: Number(r[4]), chatUsers: r[5], title: r[11] ?? '' } : null;
 }
 
 // 이 채널을 점검했던 기록 전부(최근 200회). 앱이 추세 그래프로 그린다.
@@ -255,7 +294,7 @@ function loadWatch(channelId) {      // 방송시작 → [{t, viewers, chatUsers
             const m = f.match(/^(\d{4}-\d\d-\d\d)-(\d\d)-(\d\d)-(\d\d)\.tsv$/);
             if (!m) continue;
             const rows = fs.readFileSync(path.join(WATCH_DIR, d, f), 'utf8').trim().split('\n').slice(1).map((l) => l.split('\t'))
-                .map((c) => ({ t: toMs(c[0]), viewers: Number(c[1]), chatUsers: c[2] === '' ? null : Number(c[2]) }))
+                .map((c) => ({ t: toMs(c[0]), viewers: Number(c[1]), chatUsers: c[2] === '' ? null : Number(c[2]), title: c[4] ?? '' }))
                 .filter((r) => Number.isFinite(r.t));
             (out[`${m[1]} ${m[2]}:${m[3]}:${m[4]}`] ||= []).push(...rows);
         }
@@ -317,25 +356,33 @@ async function sample(channelId) {
         chatUsers = bdy?.userCount ?? null;
     }
     return { t: Date.now(), name: d.channel?.channelName || channelId.slice(0, 8), openDate: d.openDate ?? '',
-        viewers: d.concurrentUserCount ?? 0, chatUsers, category: d.liveCategoryValue ?? '', title: d.liveTitle ?? '' };
+        viewers: d.concurrentUserCount ?? 0, chatUsers, category: d.liveCategoryValue ?? '', title: d.liveTitle ?? '',
+        thumbUrl: d.liveImageUrl ? d.liveImageUrl.replace('{type}', '720') : null };
 }
 
 // 멈출 때까지(또는 방송이 끝나거나 12시간이 지날 때까지) 일정 간격으로 잰다.
 // 앱이 띄운 경우 앱이 사라지면 같이 끝난다: 부모가 없어지거나 출력이 막히면 종료.
 async function watch(channelId, intervalSec) {
     process.stdout.on('error', () => process.exit(0));
+    for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => process.exit(0));
     const end = Date.now() + 12 * 3600e3;
-    let rows = null, file = null;
+    let rows = null, file = null, dir = null, lastJumpAt = 0;
+    // 지켜보기를 시작할 때, 제목이 바뀔 때, 급증이 잡힐 때 그 순간의 방송 화면을 남긴다
+    const snap = async (r, why) => {
+        if (!r.thumbUrl) return;
+        const res = await fetch(r.thumbUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(NET_TIMEOUT_MS) }).catch(() => null);
+        if (res?.ok) fs.writeFileSync(path.join(dir, `화면_${full(r.t).replace(/[-:]/g, '').replace(' ', '-')}_${why}.jpg`), Buffer.from(await res.arrayBuffer()));
+    };
     while (Date.now() < end && process.ppid !== 1) {
         const r = await sample(channelId).catch(() => undefined);
         if (r === null) { say('방송이 끝났습니다.'); emit({ type: 'watchEnd', message: '방송이 끝나서 지켜보기를 멈췄습니다' }); return; }
         if (r) {
             if (!rows) {      // 같은 방송을 전에 지켜본 기록이 있으면 이어서 쌓는다
-                const dir = path.join(WATCH_DIR, `${safe(r.name)}_${channelId.slice(0, 8)}`);
+                dir = path.join(WATCH_DIR, `${safe(r.name)}_${channelId.slice(0, 8)}`);
                 fs.mkdirSync(dir, { recursive: true });
                 file = path.join(dir, r.openDate.replace(/[: ]/g, '-') + '.tsv');
                 if (!fs.existsSync(file)) fs.writeFileSync(file, '시각\t시청자\t채팅방인원\t카테고리\t제목\n');
-                rows = (loadWatch(channelId)[r.openDate] || []).map((x) => ({ ...x, title: '' }));
+                rows = loadWatch(channelId)[r.openDate] || [];
             }
             fs.appendFileSync(file, [full(r.t), r.viewers, r.chatUsers ?? '', clean(r.category), clean(r.title)].join('\t') + '\n');
             const first = rows.length === 0 || !rows.sent;
@@ -343,27 +390,41 @@ async function watch(channelId, intervalSec) {
             const settled = (openMs(r) || 0) + T.startGraceMin * 60000;
             const jump = findJump(rows.filter((x) => x.t >= settled).map((x) => ({ t: x.t, member: x.viewers })));
             const last30 = rows.filter((x) => r.t - x.t <= 30 * 60000).map((x) => x.viewers);
+            const changes = [];
+            for (let i = 1; i < rows.length; i++) {
+                if (rows[i].title && rows[i - 1].title && rows[i].title !== rows[i - 1].title) changes.push({ t: rows[i].t, title: rows[i].title });
+            }
+            if (first) await snap(r, '시작');
+            else if (changes.at(-1)?.t === r.t) await snap(r, '제목변경');
+            else if (jump && jump.to.t === r.t && jump.from.t !== lastJumpAt) await snap(r, '급증');
+            if (jump) lastJumpAt = jump.from.t;
             say(`${hm(r.t)}  시청자 ${r.viewers} / 채팅방 ${r.chatUsers ?? '?'}  ${r.title.slice(0, 30)}`);
-            emit({ type: 'tick', channelId, name: r.name, openDate: r.openDate, file, jump,
+            emit({ type: 'tick', channelId, name: r.name, openDate: r.openDate, file, jump, changes,
                 range30: [Math.min(...last30), Math.max(...last30)], title: r.title,
                 rows: first ? rows.map(({ t, viewers, chatUsers }) => ({ t, viewers, chatUsers })) : undefined,
                 row: { t: r.t, viewers: r.viewers, chatUsers: r.chatUsers } });
             rows.sent = true;
         }
-        await sleep(intervalSec * 1000);
+        // 다음 측정까지 기다리되, 1초마다 부모가 살아 있는지 본다 (앱이 강제 종료돼도 곧바로 따라 끝난다)
+        for (let i = 0; i < intervalSec && process.ppid !== 1; i++) await sleep(1000);
     }
 }
 
-async function saveEvidence(s, a, text) {
+async function saveEvidence(s, a, text, draftText) {
     const stamp = full(s.checkedAt).replace(/[-:]/g, '').replace(' ', '-');
     const dir = path.join(BASE, '증거', `${safe(s.name)}_${s.channelId.slice(0, 8)}`, stamp);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, '요약.txt'), text + '\n');
     fs.writeFileSync(path.join(dir, '원본.json'), JSON.stringify({ ...s, 분석: { ...a, series: undefined } }, null, 4));
     if (s.thumbUrl) {
-        const r = await fetch(s.thumbUrl, { headers: { 'User-Agent': UA } }).catch(() => null);
+        const r = await fetch(s.thumbUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(NET_TIMEOUT_MS) }).catch(() => null);
         if (r?.ok) fs.writeFileSync(path.join(dir, '화면.jpg'), Buffer.from(await r.arrayBuffer()));
     }
+    fs.writeFileSync(path.join(dir, '신고문_초안.txt'), draftText + '\n');
+    // 저장한 뒤 파일이 바뀌지 않았음을 보일 수 있게 해시를 남긴다. 확인: shasum -a 256 -c 해시.txt
+    const hashes = fs.readdirSync(dir).filter((f) => f.normalize('NFC') !== '해시.txt').sort()
+        .map((f) => `${createHash('sha256').update(fs.readFileSync(path.join(dir, f))).digest('hex')}  ${f.normalize('NFC')}`);
+    fs.writeFileSync(path.join(dir, '해시.txt'), hashes.join('\n') + '\n');
     return dir;
 }
 
@@ -374,9 +435,11 @@ async function checkOne(channelId, saveMin) {
     const prev = loadPrev(channelId, s.openDate);
     const a = analyze(s, prev);
     const text = summary(s, a, prev);
-    const dir = a.signals.length >= saveMin ? await saveEvidence(s, a, text) : null;
     appendHistory(s, a);
-    emit({ type: 'result', s, a, prev, dir, text, history: loadHistory(channelId), pattern: buildPattern(channelId, s.name),
+    const pattern = buildPattern(channelId, s.name);
+    const draftText = draft(s, a, pattern);
+    const dir = a.signals.length >= saveMin ? await saveEvidence(s, a, text, draftText) : null;
+    emit({ type: 'result', s, a, prev, dir, text, draft: draftText, history: loadHistory(channelId), pattern,
         channelDir: path.join(BASE, '증거', `${safe(s.name)}_${channelId.slice(0, 8)}`) });
     return { s, a, text, dir };
 }
@@ -438,7 +501,7 @@ function demo() {
         });
         const pattern = { broadcasts, roseCount: broadcasts.filter((b) => b.rose).length, text: '(예시 데이터)' };
         const history = [{ time: full(now), openDate: s.openDate, viewers: s.viewers, chatUsers: s.chatUsers, followers: s.followers, signals: a.signals.length, chatRate: a.chatRate }];
-        emit({ type: 'result', s, a, prev: null, dir: null, text: summary(s, a, null), history, pattern, channelDir: null });
+        emit({ type: 'result', s, a, prev: null, dir: null, text: summary(s, a, null), draft: draft(s, a, pattern), history, pattern, channelDir: null });
         say(summary(s, a, null) + '\n');
     };
     // 방송 한 편: 조용하다가 3시간 반쯤 지나 갑자기 늘어나는 모양
@@ -492,6 +555,11 @@ function selftest() {
     assert.equal(rz.rose, true); assert.equal(rz.low.viewers, 16); assert.equal(rz.high.viewers, 40);
     rz = riseOf([{ min: 2, viewers: 3 }, { min: 10, viewers: 60 }, { min: 30, viewers: 62 }, { min: 90, viewers: 66 }]);
     assert.equal(rz.rose, false);
+    // 참고할 상황: 드롭스가 걸린 방송, 직전 점검 뒤 제목이 바뀐 방송
+    a = analyze({ ...base, drops: 123, title: '광고', chats: [chat(1, 45)] }, { time: '2026-11-20 01:00:00', viewers: 30, chatUsers: '45', title: '게임' });
+    assert.equal(a.context.length, 2); assert.deepEqual(a.signals, []);
+    const dr = draft({ ...base, name: '예시', channelId: 'x', title: '광고', category: '게임', openDate: '2026-11-20 00:00:00' }, a, null);
+    assert.match(dr, /드롭스/); assert.match(dr, /단정하지 않습니다/);
     // 작은 방송은 비율 신호를 내지 않음
     a = analyze({ ...base, viewers: 8, chatUsers: 2, chats: [] }, null);
     assert.deepEqual(a.signals, []);

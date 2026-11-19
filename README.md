@@ -36,7 +36,9 @@
 - 방송 훑어보기 : 시청자 범위를 정해 여러 방송을 한 번에 살펴 눈여겨볼 후보를 찾는다
 - 지켜보기 : 직접 켰을 때만 30초마다 기록한다. 창을 닫으면 멈춘다
 - 반복 패턴 : 같은 채널의 여러 방송을 겹쳐 그려, 같은 모양이 되풀이되는지 본다
-- 근거 저장 : 점검할 때마다 요약문·원본 데이터·방송 화면을 폴더로 남기고, 보고서 그림 한 장으로도 뽑는다
+- 근거 저장 : 점검할 때마다 요약문·원본 데이터·방송 화면·신고문 초안을 폴더로 남기고, 파일 해시를 함께 적는다. 보고서 그림 한 장으로도 뽑는다
+- 함께 볼 상황 : 드롭스, 같이보기, 파티, 유료 광고 표시처럼 시청자가 늘 만한 정상적인 사정이 있는지 같이 보여 준다
+- 리소스 정리 : 동작이 끝날 때마다 프로세스와 연결을 거두고 닫는다 ([리소스 관리](#리소스-관리))
 
 > 이 앱이 내는 "의심 신호"는 판정 기준을 넘었다는 뜻일 뿐, 조작을 확정하지 않는다.
 > 실제 접속 기록은 치지직만 확인할 수 있다. 특정 채널을 공개적으로 지목하는 데 쓰지 말고,
@@ -69,15 +71,17 @@ brew install node
 
 1. 치지직 방송 주소(`https://chzzk.naver.com/live/...`)나 채널 ID 를 넣고 `점검`
 2. 오른쪽에 의심 신호, 숫자 카드, 그래프가 나온다
-3. 신고할 때는 `요약 복사`(⇧⌘C) 로 글을, `보고서 저장`(⌘S) 으로 그림을 만든다
+3. 신고할 때는 `신고문 초안 복사`(⌥⌘C) 나 `요약 복사`(⇧⌘C) 로 글을, `보고서 저장`(⌘S) 으로 그림을 만든다
 
 그 밖의 기능
 
 - 방송 훑어보기(⇧⌘R) : 시청자 범위·개수·카테고리를 정해 지금 방송 중인 채널을 훑는다. 5곳 이상 점검하면 카드에 "목록 중앙값" 이 같이 나와, 이 방송만 유독 다른지 볼 수 있다
-- 지켜보기(⌘K) : 고른 방송의 시청자수와 채팅방 인원을 30초마다 기록한다. 계단처럼 오르는지, 오래 전혀 움직이지 않는지를 본다. 앱이 열려 있는 동안만 돈다
+- 지켜보기(⌘K) : 고른 방송의 시청자수와 채팅방 인원을 30초마다 기록한다. 계단처럼 오르는지, 오래 전혀 움직이지 않는지를 본다. 방송 제목이 바뀐 시점을 그래프에 표시하고, 시작할 때·제목이 바뀔 때·급증이 잡힐 때 방송 화면을 저장한다. 앱이 열려 있는 동안만 돈다
 - 관심 채널(⌘D) : 별 버튼으로 넣어 두고 `모두 점검`(⇧⌘D) 으로 한 번에 다시 점검한다
 - 방송별 비교 : 점검·지켜보기 기록을 방송별로 묶어 "방송 시작 후 경과 시간" 에 맞춰 겹쳐 그린다. `반복 패턴 보고서 저장`(⇧⌘S) 으로 그림과 요약문을 남긴다
 - 목록 정렬 : 신호 많은 순, 시청자 많은 순, 채팅방 비율 낮은 순
+- 목록 비우기(⇧⌘⌫) : 목록, 지켜보기 기록, 그림 캐시를 비운다. 저장 폴더의 파일은 건드리지 않는다
+- 업데이트 확인 : 앱 메뉴에서 누를 때만 GitHub 릴리스와 버전을 비교한다
 - 도움말 > 판정 기준 보기, 예시 데이터로 둘러보기
 
 ## 무엇을 보는가
@@ -93,6 +97,10 @@ brew install node
 | (참고) 채팅이 몇 계정에 쏠림 | 시청자 50명 이상인데 최근 채팅 20개 이상이 계정 3개 이하 |
 
 기준값은 `src/check.mjs` 맨 위 `T` 에 모여 있다. 표본이 쌓이면 조정이 필요할 수 있다.
+기준을 이렇게 잡은 까닭과 시험하다 고친 오판은 [설계와 검증](docs/01-설계와-검증.md)에 적었다.
+
+신호와 따로 "함께 볼 상황"을 보여 준다. 드롭스(시청 보상), 같이보기, 파티 방송, 유료 광고 표시가 켜져 있으면
+시청자가 늘 만한 정상적인 사정이 있다는 뜻이고, 하나도 없으면 그 사실이 근거가 된다.
 
 카드와 그래프로 같이 보여 주는 값 : 시청자수, 채팅방 접속 인원과 그 비율, 채팅 속도(분당),
 채팅 참여 계정 수와 한 계정 쏠림, 마지막 채팅, 팔로워, 다시보기 조회수, 채팅 활동량,
@@ -119,15 +127,33 @@ brew install node
 │   ├── <점검 시각>/요약.txt      신고할 때 붙여 넣을 글
 │   ├── <점검 시각>/원본.json     점검에 쓴 값 전부
 │   ├── <점검 시각>/화면.jpg      그 순간 방송 화면
+│   ├── <점검 시각>/신고문_초안.txt  확인을 요청하는 글의 초안 (본 것만 적고 단정하지 않는다)
+│   ├── <점검 시각>/해시.txt      위 파일들의 SHA-256. `shasum -a 256 -c 해시.txt` 로 바뀌지 않았는지 확인
 │   ├── <점검 시각>/보고서.png    "보고서 저장" 으로 만든 그림
 │   └── 반복패턴_<시각>.png·txt   "반복 패턴 보고서 저장" 결과
-├── 지켜보기/<채널>_<ID 앞 8자>/<방송 시작>.tsv   30초 간격 기록
+├── 지켜보기/<채널>_<ID 앞 8자>/
+│   ├── <방송 시작>.tsv           30초 간격 기록
+│   └── 화면_<시각>_<사유>.jpg    시작·제목변경·급증 때의 방송 화면
 └── 보고서/                      증거 폴더가 없는 방송의 보고서 그림
 ```
 
 - 채팅 닉네임과 채팅 내용은 저장하지 않는다. 계정은 그 점검 안에서만 통하는 익명 번호(계정1, 계정2 …)로 바꾼다
 - 훑어보기에서는 신호가 2건 이상인 방송만 증거 폴더를 만든다. 나머지는 `다시 점검` 을 누르면 저장한다
-- 외부로 보내는 것은 없다. 치지직 서버에서 읽기만 한다
+- 외부로 보내는 것은 없다. 치지직 서버에서 읽기만 한다 (업데이트 확인을 누르면 GitHub 에 최신 버전만 묻는다)
+- 증거는 앱이 자동으로 지우지 않는다. 설정에서 저장 폴더가 쓰는 용량을 볼 수 있다
+
+## 리소스 관리
+
+동작 하나가 끝날 때마다 그 동작이 쓴 것을 치운다.
+
+- 점검은 `check.mjs` 를 한 번 실행하고 끝난다. 앱은 프로세스가 끝날 때까지 기다려 거두고, 파이프를 닫고, 참조를 비운다
+- 네트워크 요청에는 10초 제한이 있고, 채팅 연결은 성공·오류·시간 초과 어느 경로든 닫는다
+- 지켜보기는 직접 켰을 때만 돌고, 방송이 끝나거나 12시간이 지나면 스스로 멈춘다
+- 취소, 목록에서 지우기, 창 닫기, 앱 종료 때 남은 프로세스를 끝낸다. 앱이 강제 종료되어도 지켜보기 프로세스는 1초 안에 따라 끝난다
+- 목록은 300건, 방송 화면 그림 캐시는 20장까지만 쥐고 있다
+- 창을 닫으면 앱이 끝나고, 남는 프로세스가 없다
+
+점검 반복·지켜보기·종료 각 단계에서 남는 프로세스와 열린 파일 수를 잰 값은 [설계와 검증](docs/01-설계와-검증.md#리소스-관리)에 있다.
 
 ## 필요한 것
 
@@ -178,8 +204,8 @@ Xcode 프로젝트 없이 `swiftc` 한 번으로 빌드한다. macOS 14 이상, 
 ./scripts/build.sh install
 ```
 
-`install` 을 붙이면 `/Applications/치지직 점검.app` 으로 복사한다.
-서명은 애드혹(`codesign -s -`)이라 이 맥에서만 쓰는 용도다.
+`install` 을 붙이면 `/Applications/치지직 점검.app` 으로 복사한다. 앱이 떠 있으면 정상 종료시킨 뒤 바꾸고 다시 띄운다.
+서명은 애드혹(`codesign -s -`, 강화 런타임 켬)이라 이 맥에서만 쓰는 용도다.
 
 ```bash
 ./scripts/build.sh zip
@@ -200,7 +226,9 @@ chzzk-check/
 ├── README.md                 이 문서
 ├── LICENSE                   MIT 라이선스
 ├── docs/
+│   ├── 01-설계와-검증.md      설계 결정, 시험 결과, 리소스 관리
 │   ├── icon.png              README 용 아이콘
+│   ├── social-preview.png    GitHub 대표 이미지 (링크 공유 때 표시)
 │   └── screenshots/          README 용 화면 (예시 데이터)
 ├── src/
 │   ├── check.mjs             점검·판정 로직 전부 (Node.js, 추가 패키지 없음)
@@ -208,7 +236,8 @@ chzzk-check/
 │   ├── AppIcon.icon/         아이콘 원본 (Icon Composer 형식)
 │   └── Info.plist
 ├── scripts/
-│   └── build.sh              빌드·설치·릴리스 zip
+│   ├── build.sh              빌드·설치·릴리스 zip
+│   └── make-social-preview.swift  대표 이미지 생성
 └── build/                    빌드 산출물 (지워도 다시 만들어짐)
 ```
 
@@ -240,7 +269,9 @@ a stream snapshot and a report image) that you can attach when asking CHZZK to l
 - Scan : check many live broadcasts in a viewer range at once to find candidates worth a closer look
 - Watch : samples every 30 seconds only while you turn it on. Stops when the window closes
 - Recurring pattern : overlays several broadcasts of one channel to see whether the same shape repeats
-- Evidence : each check saves a summary, raw data and a snapshot, and can be exported as a single report image
+- Evidence : each check saves a summary, raw data, a snapshot, a draft request and SHA-256 hashes, and can be exported as a single report image
+- Context : shows whether drops, watch party, party broadcast or paid promotion flags are on, since those are ordinary reasons for viewers to rise
+- Cleanup : every action reaps its process and closes its connections when it ends. No process is left after the window closes
 
 > A "signal" only means a threshold was crossed. It does not prove manipulation.
 > Only CHZZK can see actual connection records. Do not use this to accuse a channel in public.
