@@ -41,8 +41,10 @@ if [[ "${1:-}" == "install" ]]; then
         for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -x ChzzkCheck >/dev/null || break; sleep 0.5; done
         pkill -x ChzzkCheck 2>/dev/null || true
     fi
-    rm -rf "/Applications/$NAME_APP"
-    cp -R "$APP" /Applications/
+    # 지우고 새로 넣지 않고 제자리에서 갱신한다. 같은 폴더가 유지되어 Dock 에 올려 둔 아이콘이 끊기지 않는다
+    mkdir -p "/Applications/$NAME_APP"
+    rsync -a --delete "$APP/" "/Applications/$NAME_APP/"
+    touch "/Applications/$NAME_APP"
     echo "설치 완료: /Applications/$NAME_APP"
     if [[ $WAS_RUNNING == 1 ]]; then open "/Applications/$NAME_APP"; fi
 fi
